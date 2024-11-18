@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -75,6 +77,10 @@ var rootCmd = &cobra.Command{
 		}
 		defer resp.Body.Close()
 
+		if resp.StatusCode == http.StatusConflict {
+			log.Fatalf("Repository name already exists on this account.")
+		}
+
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			log.Fatalf("Failed to read response body: %v", err)
@@ -85,6 +91,7 @@ var rootCmd = &cobra.Command{
 		fmt.Println("Starting migration...")
 
 		// Extract the tar archive
+		fmt.Printf("Extracting tar archive from %s to ./extracted\n", archivePath)
 		err = extractTarArchive(archivePath, "./extracted")
 		if err != nil {
 			log.Fatalf("Failed to extract tar archive: %v", err)
@@ -160,13 +167,32 @@ func getOrgID(orgName, githubPat string) (string, error) {
 }
 
 func extractTarArchive(src, dest string) error {
+	if err := os.RemoveAll(dest); err != nil {
+		return err
+	}
+
+	// Create the destination directory if it doesn't exist
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return err
+	}
+
 	file, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	tarReader := tar.NewReader(file)
+	var tarReader *tar.Reader
+	if strings.HasSuffix(src, ".gz") {
+		gzr, err := gzip.NewReader(file)
+		if err != nil {
+			return err
+		}
+		defer gzr.Close()
+		tarReader = tar.NewReader(gzr)
+	} else {
+		tarReader = tar.NewReader(file)
+	}
 
 	for {
 		header, err := tarReader.Next()
@@ -177,7 +203,19 @@ func extractTarArchive(src, dest string) error {
 			return err
 		}
 
-		target := filepath.Join(dest, header.Name)
+		// Strip the top-level directory component
+		relativePath := header.Name
+		if idx := strings.Index(relativePath, "/"); idx != -1 {
+			relativePath = relativePath[idx+1:]
+		}
+
+		// Skip empty paths (which can happen if the top-level directory is stripped)
+		if relativePath == "" {
+			continue
+		}
+
+		target := filepath.Join(dest, relativePath)
+
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
@@ -196,6 +234,10 @@ func extractTarArchive(src, dest string) error {
 				return err
 			}
 			outFile.Close()
+		case tar.TypeXGlobalHeader:
+			// Ignore the global header
+		default:
+			fmt.Printf("Unable to untar type: %c in file %s\n", header.Typeflag, header.Name)
 		}
 	}
 	return nil
